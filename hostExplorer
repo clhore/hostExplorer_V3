@@ -1,0 +1,732 @@
+#!/home/ad5ian/project/BotNet/venv/bin/python3
+
+# Author: Adrian Lujan Muñoz ( aka clhore )
+
+from ipaddress import ip_address, ip_network, IPv4Address, IPv4Interface, AddressValueError, NetmaskValueError
+from scapy.all import get_if_hwaddr, conf
+from scapy.layers.inet import IP, TCP, UDP, Ether, getmacbyip, ICMP
+from scapy.layers.l2 import ARP
+from scapy.sendrecv import sr, sr1, srp, srp1
+from typing import List, Any, Tuple
+from progress.bar import Bar, ChargingBar
+from argparse import ArgumentParser
+from tabulate import tabulate
+from icmplib import ping
+from enum import IntEnum
+import pandas as pd
+from os.path import isfile, isdir
+import threading
+import logging
+import socket
+import nmap3
+import os
+
+
+IP_INFO_LIST: list[Any] = list()
+ICMP_DESTINATION_UNREACHABLE = 3
+
+
+class IcmpCodes(IntEnum):
+    """
+    ICMP codes, to decide
+    Reference: https://www.ibm.com/docs/en/qsip/7.4?topic=applications-icmp-type-code-ids
+    """
+    Host_is_unreachable = 1
+    Protocol_is_unreachable = 2
+    Port_is_unreachable = 3
+    Communication_with_destination_network_is_administratively_prohibited = 9
+    Communication_with_destination_host_is_administratively_prohibited = 10
+    Communication_is_administratively_prohibited = 13
+
+
+FILTERED_CODES = [x.value for x in IcmpCodes]
+
+
+class TcpFlags(IntEnum):
+    """
+    Reference: https://www.wireshark.org/docs/wsug_html_chunked/ChAdvTCPAnalysis.html
+    """
+    SYNC_ACK = 0x12
+    RST_PSH = 0x14
+
+
+class RESPONSES(IntEnum):
+    """"
+    Reference: https://www.redhat.com/sysadmin/test-tcp-python-scapy
+    """
+    FILTERED = 0
+    CLOSED = 1
+    OPEN = 2
+    ERROR = 3
+
+
+def client_list(net: str, mask: str) -> list:
+    ip_list: list = list(
+        ip_network('{red}/{mask}'.format(red=net, mask=mask))
+    )
+    return ip_list
+
+
+def network_ip_parsec(net: str) -> str or bool:
+    try:
+        return format(ip_address(net))
+    except ValueError:
+        raise ValueError('ERROR: Network address incorrect')
+
+
+def mask_parsec(net, mask) -> str or bool:
+    try:
+        return IPv4Interface('{red}/{mask}'.format(red=net, mask=mask)) \
+            .with_netmask.split('/')[1]
+    except AddressValueError:
+        raise ValueError('ERROR: Network mask address incorrect')
+    except NetmaskValueError:
+        raise ValueError('ERROR: Network mask address incorrect')
+
+
+def ports_parsec(ports):
+    delimiter: tuple = ('-', ',')
+    list_ports: list = []
+    try:
+        if ports is None:
+            return ports
+        elif type(eval(ports)) is not int and (delimiter[0] not in ports and delimiter[1] not in ports):
+            raise ValueError()
+        elif delimiter[0] in ports and delimiter[1] in ports:
+            raise ValueError()
+
+        if (delimiter[0] not in ports and delimiter[1] not in ports) and int(ports) <= 65535:
+            list_ports.append(int(ports))
+
+        elif delimiter[0] in ports:
+            _ports = ports.split(delimiter[0])
+
+            if len(_ports) > 2:
+                raise ValueError()
+            if (int(_ports[0]) > 65535 or int(_ports[1]) > 65535) or int(_ports[0]) == int(_ports[1]):
+                raise ValueError()
+
+            list_ports: list = [int(i) for i in range(int(_ports[0]), int(_ports[1])+1)]
+
+        elif delimiter[1] in ports:
+            list_ports: list = [int(i) for i in ports.split(delimiter[1]) if int(i) <= 65535]
+            if len(list_ports) == 0:
+                raise ValueError()
+    except ValueError:
+        raise ValueError(f'ERROR: Value error {ports}')
+    except Exception as e:
+        raise ValueError(e)
+    return list_ports
+
+
+def check_icmp_scan(ipaddress: str) -> bool:
+    try:
+        host: object = ping(ipaddress, count=2, privileged=False)
+        return host.is_alive
+    except (InterruptedError, KeyboardInterrupt):
+        raise InterruptedError('ERROR: Scan process canceled')
+    except UnicodeError:
+        return False
+
+
+def check_tcp_host(ipaddress: str, ports: tuple = None) -> bool:
+    default_ports = [20, 135, 137, 138, 139, 143, 21, 22, 23, 25, 548, 53, 443, 445, 3389, 587, 80, 465, 993, 995, 3306,
+                     110, 111, 631]
+    ports: list = default_ports if ports is None else ports
+
+    session: object = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    socket.setdefaulttimeout(2)
+
+    res: bool = False
+    try:
+        for port in ports:
+            result: int = session.connect_ex((ipaddress, port))
+            session.close()
+
+            if result == 111: res: bool = True; break
+    except (InterruptedError, KeyboardInterrupt):
+        session.close()
+        raise InterruptedError('ERROR: Scan process canceled')
+    return res
+
+
+def sr1_send_request(packet, timeout: int = 1, retry: int = 0, verbose: bool = False):
+    return sr1(packet, retry=retry, timeout=timeout, verbose=verbose, chainCC=True)
+
+
+def sr_send_request(packet, timeout: int = 1, retry: int = 0, verbose: bool = False):
+    return sr(packet, retry=retry, timeout=timeout, verbose=verbose, chainCC=True)
+
+
+def sr1_check_answered_response(answered):
+    res: RESPONSES = RESPONSES.CLOSED
+    try:
+        if not answered:
+            res: RESPONSES = RESPONSES.CLOSED
+        elif answered.haslayer(TCP):
+            if answered.getlayer(TCP).flags == TcpFlags.SYNC_ACK:
+                res: RESPONSES = RESPONSES.OPEN
+            elif answered.getlayer(TCP).flags == TcpFlags.RST_PSH:
+                res: RESPONSES = RESPONSES.CLOSED
+        elif answered.haslayer(ICMP):
+            icmp_type = answered.getlayer(ICMP).type
+            icmp_code = int(answered.getlayer(ICMP).code)
+            if icmp_type == ICMP_DESTINATION_UNREACHABLE and icmp_code in FILTERED_CODES:
+                res: RESPONSES = RESPONSES.FILTERED
+    except (socket.gaierror, AttributeError, TypeError):
+        res: RESPONSES = RESPONSES.ERROR
+    return res
+
+
+def tcp_sync_answered_response(answered, rst_packet):
+    res: RESPONSES = RESPONSES.CLOSED
+    try:
+        if sr1_check_answered_response(answered) == RESPONSES.OPEN:
+            # sr_send_request(packet=rst_packet)
+            res: RESPONSES = RESPONSES.OPEN
+    except (socket.gaierror, AttributeError, TypeError):
+        return RESPONSES.ERROR
+    return res
+
+
+def sync_scan_tcp(ipaddress: str, ports: tuple = None, timeout: int = 1, retry: int = 0) -> tuple[bool, list]:
+    default_ports = [20, 135, 137, 138, 139, 143, 21, 22, 23, 25, 548, 53, 443, 445, 3389, 587, 80, 465, 993, 995, 3306,
+                     110, 111, 631]
+    ports: list = default_ports if ports is None else ports
+    is_alive: bool = False
+    res: list = []
+
+    try:
+        conf.use_pcap = True
+
+        for port in ports:
+            try:
+                packet = IP(dst=ipaddress) / TCP(flags="S", dport=port)
+                ans = sr1_send_request(packet=packet, timeout=timeout, retry=retry)
+
+                response_code = tcp_sync_answered_response(ans, packet)
+
+                if response_code == RESPONSES.OPEN or response_code == RESPONSES.FILTERED:
+                    # status_port = 'OPEN' if response_code == RESPONSES.OPEN else 'FILTERED'
+                    res.append(f'{port}/tcp')
+                    is_alive = True
+            except (socket.gaierror, AttributeError):
+                res: bool = False
+            except (InterruptedError, KeyboardInterrupt):
+                raise InterruptedError('ERROR: Scan process canceled')
+    except InterruptedError:
+        raise InterruptedError('ERROR: Scan process canceled')
+    return is_alive, res
+
+
+def simple_scan_tcp(ipaddress: str, ports: tuple = None, timeout: int = 1, retry: int = 0) -> tuple[bool, list]:
+    default_ports = [20, 135, 137, 138, 139, 143, 21, 22, 23, 25, 548, 53, 443, 445, 3389, 587, 80, 465, 993, 995, 3306,
+                     110, 111, 631]
+    ports: list = default_ports if ports is None else ports
+    is_alive: bool = False
+    res: list = []
+
+    try:
+        conf.use_pcap = True
+
+        for port in ports:
+            try:
+                packet = IP(dst=ipaddress) / TCP(dport=port)
+                ans = sr1_send_request(packet=packet, timeout=timeout, retry=retry)
+
+                response_code = sr1_check_answered_response(ans)
+                if response_code == RESPONSES.OPEN or response_code == RESPONSES.FILTERED:
+                    # status_port = 'OPEN' if response_code == RESPONSES.OPEN else 'FILTERED'
+                    res.append(f'{port}/tcp')
+                    is_alive = True
+            except (socket.gaierror, AttributeError):
+                res: bool = False
+            except (InterruptedError, KeyboardInterrupt):
+                raise InterruptedError('ERROR: Scan process canceled')
+    except InterruptedError:
+        raise InterruptedError('ERROR: Scan process canceled')
+    return is_alive, res
+
+
+def scrapy_scan_tcp_host(ipaddress: str, ports: tuple = None, timeout: int = 1, retry: int = 0) -> bool:
+    default_ports = [20, 135, 137, 138, 139, 143, 21, 22, 23, 25, 548, 53, 443, 445, 3389, 587, 80, 465, 993, 995, 3306,
+                     110, 111, 631]
+    ports: list = default_ports if ports is None else ports
+    conf.use_pcap = True
+    res: bool = False
+
+    try:
+        packet = IP(dst=ipaddress) / TCP(flags="S", dport=ports)
+        ans = sr1_send_request(packet=packet)
+        # sr(packet, retry=retry, timeout=timeout, verbose=False, chainCC=True)
+        # _.sr
+
+        # response = sr1(packet, timeout=2, verbose=False)
+        # res = response.haslayer(UDP) if response else res
+        res = True if ans else res
+    except (socket.gaierror, AttributeError):
+        res: bool = False
+    except (InterruptedError, KeyboardInterrupt):
+        raise InterruptedError('ERROR: Scan process canceled')
+    except InterruptedError:
+        raise InterruptedError('ERROR: Scan process canceled')
+    return res
+
+
+def scrapy_check_udp_host(ipaddress: str, ports: tuple = None, timeout: int = 1, retry: int = 0) -> bool:
+    ports: tuple = (53, 67, 68, 123, 161, 500, 514, 51820) if ports is None else ports
+    conf.use_pcap = True
+    res: bool = False
+
+    try:
+        for port in ports:
+            try:
+                packet = IP(dst=ipaddress) / UDP(dport=port)
+                ans, _ = sr(packet, retry=retry, timeout=timeout, verbose=False, chainCC=True)
+                # _.sr
+
+                # response = sr1(packet, timeout=2, verbose=False)
+                # res = ans.haslayer(UDP) if ans else res
+
+                if ans: res = True; break
+            except (socket.gaierror, AttributeError):
+                continue
+            except (InterruptedError, KeyboardInterrupt):
+                raise InterruptedError('ERROR: Scan process canceled')
+    except InterruptedError:
+        raise InterruptedError('ERROR: Scan process canceled')
+    return res
+
+
+def get_macaddress(ipaddress: str, retry: int = 2) -> str or bool:
+    macaddress: bool = False
+    try:
+        arp = ARP(pdst=ipaddress)
+        ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet = ether / arp
+
+        result = srp(packet, retry=retry, timeout=3, verbose=False, chainCC=True)[0]
+        macaddress = result[0][1].hwsrc if result else getmacbyip(ipaddress)
+        macaddress = False if macaddress is None else macaddress
+    except IndexError:
+        macaddress = False
+    except (InterruptedError, KeyboardInterrupt):
+        raise InterruptedError('ERROR: Scan process canceled')
+    return macaddress
+
+
+def get_hostname(ipaddress: str) -> str or bool:
+    hostname: bool = False
+    try:
+        hostname: str = socket.gethostbyaddr(ipaddress)[0]
+    except socket.herror:
+        hostname: bool = False
+    except KeyError:
+        hostname: bool = False
+    except (InterruptedError, KeyboardInterrupt):
+        raise InterruptedError('ERROR: Scan process canceled')
+    return hostname
+
+
+def nmap_get_macaddress_hostname(ipaddress: str) -> tuple[str | bool, str | bool]:
+    nmap = nmap3.NmapHostDiscovery()
+
+    macaddress: bool = False
+    hostname: bool = False
+
+    try:
+        result = nmap.nmap_no_portscan(ipaddress)
+
+        macaddress: str = result[ipaddress]['macaddress']['addr']
+        hostname: str = result[ipaddress]['hostname']['name']
+    except (KeyError, TypeError):
+        macaddress: bool = False
+        hostname: bool = False
+    except KeyboardInterrupt:
+        raise InterruptedError('ERROR: Scan process canceled')
+    finally:
+        return macaddress, hostname
+
+
+'''
+def hostname_scan(ipaddress: str) -> str or bool:
+    host_info: object = nmap3.NmapScanTechniques().nmap_ping_scan(ipaddress)
+    hostname: object = None
+    macaddress: object = None
+
+    try:
+        hostname: str = host_info[ipaddress]['hostname'][0]['name']
+    except IndexError:
+        hostname: bool = False
+    except TypeError:
+        hostname: bool = False
+    except KeyError:
+        hostname: bool = False
+
+    try:
+        macaddress: dict = host_info[ipaddress]['macaddress']['addr']
+    except IndexError:
+        macaddress: bool = False
+    except TypeError:
+        macaddress: bool = False
+    except KeyError:
+        macaddress: bool = False
+
+    return hostname, macaddress
+'''
+
+
+class Hilo(threading.Thread):
+    def __init__(self, ip_list: list, ports: list = None, _sockets: bool = False,
+                 icmp: bool = True, tcp: bool = None, udp: bool = None,
+                 hostname: bool = None, progress_bar: object = None):
+        threading.Thread.__init__(self)
+        self.IP_LIST: list = ip_list
+        self.PORTS = ports
+        self.SOCKETS = _sockets
+        self.ICMP: bool = icmp
+        self.TCP: bool = tcp
+        self.UDP: bool = udp
+        self.HOSTNAME: bool = hostname
+        self.PROGRESS_BAR: object = progress_bar
+
+    def run(self):
+        try:
+            for ipaddress in self.IP_LIST:
+                err_icmp: bool = False
+                err_tcp: bool = False
+                err_udp: bool = False
+                hostname: bool = False
+                macaddress: bool = False
+                host_sockets: list = []
+
+                if self.ICMP:
+                    err_icmp: bool = check_icmp_scan(str(ipaddress))
+
+                if not self.SOCKETS:
+                    if self.TCP: # or not err_icmp:
+                        err_tcp: bool = check_tcp_host(ipaddress=str(ipaddress), ports=self.PORTS)
+                        # err_tcp: bool = scrapy_check_tcp_host(str(ipaddress))
+
+                    if self.UDP: # or not (err_tcp or err_icmp):
+                        err_udp = scrapy_check_udp_host(ipaddress=str(ipaddress), ports=self.PORTS)
+
+                elif self.SOCKETS:
+                    if self.TCP:
+                        # err_tcp: bool = check_tcp_host(ipaddress=str(ipaddress), ports=self.PORTS)
+                        # err_tcp, host_sockets = sync_scan_tcp(ipaddress=str(ipaddress), ports=self.PORTS)
+                        err_tcp, host_sockets = simple_scan_tcp(ipaddress=str(ipaddress), ports=self.PORTS)
+
+                    if self.UDP: # and not err_tcp:
+                        err_udp = scrapy_check_udp_host(ipaddress=str(ipaddress), ports=self.PORTS)
+
+                check_scan_hostname = (err_icmp or err_tcp or err_udp) and self.HOSTNAME
+
+                hostname = get_hostname(str(ipaddress)) if hostname is False and check_scan_hostname else hostname
+                macaddress = get_macaddress(
+                    str(ipaddress)) if macaddress is False and check_scan_hostname else macaddress
+
+                ip_info: dict = {}
+
+                if not self.SOCKETS:
+                    ip_info: dict = {
+                        'ip': str(ipaddress),
+                        'hostname': hostname,
+                        'macaddress': macaddress,
+                        'icmp': err_icmp,
+                        'tcp': err_tcp,
+                        'udp': err_udp
+                    }
+
+                if self.SOCKETS:
+                    ip_info: dict = {
+                        'ip': str(ipaddress),
+                        'hostname': hostname,
+                        'macaddress': macaddress,
+                        'icmp': err_icmp,
+                        'tcp': err_tcp,
+                        'udp': err_udp,
+                        'sockets': host_sockets
+                    }
+
+                if err_icmp or err_tcp or err_udp:
+                    IP_INFO_LIST.append(ip_info)
+
+                if (err_icmp or err_tcp or err_udp) and self.PROGRESS_BAR is not None:
+                    self.PROGRESS_BAR.message: str = f'Network Scan: [ {ipaddress} ] '
+
+                if self.PROGRESS_BAR is not None:
+                    self.PROGRESS_BAR.next()
+        except KeyboardInterrupt as err:
+            raise InterruptedError(err)
+        except Exception as err:
+            raise InterruptedError(err)
+
+
+def net_scan(ip_list, ports: list = None, hostname: bool = True, icmp: bool = True, tcp: bool = False, udp: bool = False,
+             _sockets: bool = False, _nmap: bool = False, verbose: bool = False) -> bool:
+    num_ip: int = len(ip_list)
+    threads: int = 3
+    num_threads: int = int((num_ip / threads)) + 1
+
+    bar_scan: object = ChargingBar(f'Network Scan: [ -/- ] ', max=num_ip) if verbose else None
+
+    count = 0
+    thread_list = list()
+    try:
+        for i in range(num_threads):
+            _IP_LIST = ip_list[count:count + 3]
+            thread = Hilo(_IP_LIST, ports=ports, _sockets=_sockets,
+                          icmp=icmp, tcp=tcp, udp=udp,
+                          hostname=hostname, progress_bar=bar_scan)
+            thread.start()
+            thread_list.append(thread)
+            count += 3
+    except (InterruptedError, KeyboardInterrupt) as err:
+        print('Stop thread')
+        for thread in thread_list:
+            thread.join()
+        raise InterruptedError(err)
+    for thread in thread_list:
+        thread.join()
+    return True
+
+
+def oui_detection(macaddress, rute_data_oui) -> str or bool:
+    oui = macaddress[0:8]  # .replace(':', '-')
+    with open(rute_data_oui, 'r') as file:
+        while line := file.readline().rstrip():
+            if oui.upper() in line:
+                return line.split(',')[1]
+    return False
+
+
+def csv_data(data_list, filename: str = 'log.csv'):
+    try:
+        df = pd.json_normalize(data_list)
+        df.to_csv(filename)
+        return True
+    except PermissionError:
+        return False
+
+
+def create_table(data_list: list, rute_data_oui: str, more_info: int, output_file: str = False,
+                 gui_mode: bool = False) -> object:
+    data_file: dict = {}
+    sorted_data: list = sorted(data_list, key=lambda x: x['ip'])
+
+    # if not more_info:
+    #    data_file = {
+    #        'ip': [i['ip'] for i in sorted_data],
+    #        'status': ['ONLINE' for i in sorted_data]
+    #    }
+
+    # if more_info:
+    #    data_file = {
+    #        'ip': [i['ip'] for i in sorted_data],
+    #        'hostname': [i['hostname'] for i in sorted_data],
+    #        'macaddress': [i['macaddress'] for i in sorted_data],
+    #        'oui': [oui_detection(i['macaddress'], rute_data_oui) if i['macaddress'] is not False else i['macaddress']
+    #                for i in sorted_data],
+    #        # 'status': ['ONLINE' for i in data_list]
+    #    }
+
+    # present_keys = [key for key, value in data_file.items() if value]
+    # combined_data = list(zip(*(data_file[key] for key in present_keys)))
+
+    # sorted_data = sorted(combined_data, key=lambda x: int(x[present_keys.index('ip')].split('.')[-1]))
+
+    # headers = [key.upper() for key in present_keys]
+
+    keys_to_exclude = ['tcp', 'udp', 'icmp']
+
+    for key in sorted_data[0].keys():
+        if key not in keys_to_exclude:
+            data_file[key] = [dic[key] for dic in sorted_data]
+
+    if any('macaddress' in dic and dic['macaddress'] is not False for dic in sorted_data):
+        data_file['oui'] = [
+            oui_detection(i['macaddress'], rute_data_oui) if i['macaddress'] is not False else i['macaddress']
+            for i in sorted_data
+        ]
+
+    # if not gui_mode:
+    table = tabulate(
+        data_file, headers=[i.upper() for i in data_file],
+        showindex=True, tablefmt='fancy_grid', disable_numparse=True
+    )
+
+    if output_file:
+        csv_data(sorted_data, filename=output_file)
+
+    return table
+
+
+def parser_arguments():
+    parser = ArgumentParser(description='Network Scan')
+
+    parser.add_argument('net_ip_address', type=str, help='Network address')
+
+    network_mask_description: str = 'Network mask. Default 255.255.255.0 /24'
+    parser.add_argument(
+        '--mask', '--net-mask', dest='mask', type=str,
+        help=network_mask_description, default='255.255.255.0'
+    )
+
+    scan_mode_description: str = ('Scan mode [11,12,13,19]. Default 12'
+                                  '11 (ICMP Scan), 12 (TCP Scan), 13 (UDP Scan), 19 [ALL](ICMP, TCP, UDP Scan)')
+    parser.add_argument(
+        '-m', '--mode', dest='mode', type=int,
+        help=scan_mode_description, default=12
+    )
+
+    verbose_description: str = 'ON verbose'
+    parser.add_argument(
+        '-v', '--verbose', dest='verbose', action="store_true",
+        help=verbose_description, default=False
+    )
+
+    gui_description: str = 'ON GUI mode'
+    parser.add_argument(
+        '-G', '--gui', dest='gui', action="store_true",
+        help=gui_description, default=False
+    )
+
+    ports_description: str = 'ports list (1-65535) or (22,53,123)'
+    parser.add_argument(
+        '-p', dest='check_ports', type=str,
+        help=ports_description, default=None
+    )
+
+    hostname_macaddress_host_description: str = 'None: hostname and macaddress'
+    parser.add_argument(
+        '-nhm', '--not-hostname-macaddress', dest='check_hostname_macaddress', action="store_false",
+        help=hostname_macaddress_host_description, default=True
+    )
+
+    oui_description: str = 'ON GUI mode'
+    parser.add_argument(
+        '--oui', '--mac-oui', dest='oui', type=str,
+        help=oui_description, default='/opt/hostExplorer/oui_hex.txt'
+    )
+
+    output_description: str = 'Save log to csv file [PATH]'
+    parser.add_argument(
+        '-o', '--output', dest='output', type=str,
+        help=output_description, default=False
+    )
+
+    return parser.parse_args()
+
+
+def touch(filename, flags=os.O_CREAT | os.O_RDWR):
+    os.close(os.open(filename, flags, 0o644))
+
+
+def main():
+    args: object = parser_arguments()
+
+    network: str = args.net_ip_address
+    network_mask: str = args.mask
+
+    scan_mode: int = args.mode
+    check_hostname_macaddress: bool = args.check_hostname_macaddress
+    check_ports: str = args.check_ports
+    verbose: bool = args.verbose
+    gui_mode: bool = args.gui
+
+    rute_data_oui: str = args.oui
+    output_file: str = args.output
+
+    try:
+        network: str = network_ip_parsec(network)
+        network_mask: int = mask_parsec(network, network_mask)
+        check_ports: list = ports_parsec(check_ports)
+    except ValueError as e:
+        raise InterruptedError(e)
+
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+    try:
+        with open(rute_data_oui, 'r') as f:
+            f.read()
+    except FileNotFoundError:
+        raise ValueError('ERROR: File data oui not exit')
+    except IsADirectoryError:
+        raise ValueError('ERROR: Path data oui is file not directory')
+    except PermissionError:
+        raise ValueError('ERROR: The user does not have read permission for the oui file')
+
+    if isdir(output_file):
+        raise ValueError('ERROR: Path output is file not directory')
+
+    if not os.path.exists(output_file):
+        touch(filename=output_file)
+    output_file = output_file if isfile(output_file) else False
+
+    # if not net:'
+    #    raise ValueError('ERROR: Network address incorrect')
+    # if not mask:
+    #    raise ValueError('ERROR: Network mask address incorrect')
+
+    ip_list: list = client_list(network, network_mask)
+    if not verbose:
+        print(f'Start scan - Network - [ IP: {network} MASK: {network_mask} ]', end='\r')
+
+    try:
+        # Scan use scapy and icmplib
+        if scan_mode == 11:  # ICMP
+            net_scan(ip_list, ports=check_ports, hostname=check_hostname_macaddress,
+                     icmp=True, tcp=False, udp=False,
+                     _sockets=False, _nmap=False, verbose=verbose)
+        elif scan_mode == 12:  # TCP
+            net_scan(ip_list, ports=check_ports, hostname=check_hostname_macaddress,
+                     icmp=False, tcp=True, udp=False,
+                     _sockets=False, _nmap=False, verbose=verbose)
+        elif scan_mode == 13:  # UDP
+            net_scan(ip_list, ports=check_ports, hostname=check_hostname_macaddress,
+                     icmp=False, tcp=False, udp=True,
+                     _sockets=False, _nmap=False, verbose=verbose)
+        elif scan_mode == 19:  # all
+            net_scan(ip_list, ports=check_ports, hostname=check_hostname_macaddress,
+                     icmp=True, tcp=True, udp=True,
+                     _sockets=False, _nmap=False, verbose=verbose)
+
+        # Scan use socket
+        elif scan_mode == 21:  # SYC TCP
+            net_scan(ip_list, ports=check_ports, hostname=check_hostname_macaddress,
+                     icmp=False, tcp=True, udp=False,
+                     _sockets=True, _nmap=False, verbose=verbose)
+        elif scan_mode == 22:  # UDP
+            net_scan(ip_list, ports=check_ports,  hostname=check_hostname_macaddress,
+                     icmp=False, tcp=True, udp=False,
+                     _sockets=True, _nmap=False, verbose=verbose)
+        elif scan_mode == 29:  # all
+            net_scan(ip_list, ports=check_ports, hostname=check_hostname_macaddress,
+                     icmp=True, tcp=True, udp=True,
+                     _sockets=True, _nmap=False, verbose=verbose)
+
+        # Scan use nmap
+        elif scan_mode == 31:  # TCP SYC
+            net_scan(ip_list, hostname=check_hostname_macaddress,
+                     icmp=True, tcp=False, udp=False,
+                     _sockets=False, _nmap=True, verbose=verbose)
+        elif scan_mode == 39:  # all
+            net_scan(ip_list, hostname=check_hostname_macaddress,
+                     icmp=True, tcp=True, udp=True,
+                     _sockets=False, _nmap=True, verbose=verbose)
+
+        table: object = create_table(IP_INFO_LIST, rute_data_oui, check_hostname_macaddress, output_file, gui_mode)
+        print(f"\r{' ' * 80}", end='\r')
+        print(f'\r{table}', end='\n', flush=True)
+    except (InterruptedError, KeyboardInterrupt) as err:
+        raise InterruptedError(err)
+
+
+if __name__ == '__main__':
+    try:
+        if os.getuid() != 0:
+            raise EnvironmentError(f'Scan limit (not root user)')
+        main()
+    except Exception as err:
+        print(err)
